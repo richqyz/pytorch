@@ -563,40 +563,13 @@ Tensor sparse_compressed_to_dense(
       !dtype.has_value(),
       "dtype argument is not supported by sparse_csr_to_dense");
 
-  // Guard upfront against hybrid tensors (causes segfault)
   auto batch_ndim = sparse_csr::numBatchDimensions(self);
 
-  TORCH_CHECK(
-      (self.dim() - batch_ndim) == 2,
-      "sparse_compressed_to_dense: Hybrid tensors are not supported");
+  if (self.layout() == kSparseCsr || self.layout() == kSparseCsc
+      || self.layout() == kSparseBsr || self.layout() == kSparseBsc) {
+    auto compressed_rows = self.layout() == kSparseCsr || self.layout() == kSparseBsr;
+    auto block_sparse = self.layout() == kSparseBsr || self.layout() == kSparseBsc;
 
-  if (self.layout() == kSparseCsr) {
-    Tensor dst = at::zeros(self.sizes(), self.options().layout(kStrided));
-    return dst.add_(self);
-  }
-  // dense.add_ is not yet implemented for CSC.
-  // Once it is there, use add_ instead.
-  // It is easier to implement it like this for now,
-  // because add_ will be modified to work with
-  // dense dimensions once CSR/CSC support them.
-  if (self.layout() == kSparseCsc) {
-    const auto batch_ndim = self.ccol_indices().dim() - 1;
-    auto dst_transposed_sizes = self.sizes().vec();
-    std::swap(dst_transposed_sizes[batch_ndim], dst_transposed_sizes[batch_ndim + 1]);
-    // TODO: write a utility function, or use a transpose once view semantics are there
-    const auto to_transposed_csr = at::native::_sparse_csr_tensor_unsafe(
-        self.ccol_indices(),
-        self.row_indices(),
-        self.values(),
-        dst_transposed_sizes,
-        self.values().scalar_type(),
-        kSparseCsr,
-        self.values().device());
-    auto dst_transposed = at::zeros(dst_transposed_sizes, self.options().layout(kStrided));
-    dst_transposed.add_(to_transposed_csr);
-    return dst_transposed.transpose(batch_ndim, batch_ndim + 1);
-  }
-  if (self.layout() == kSparseBsr || self.layout() == kSparseBsc) {
     Tensor compressed_indices;
     Tensor plain_indices;
     std::tie(compressed_indices, plain_indices) =
@@ -604,15 +577,16 @@ Tensor sparse_compressed_to_dense(
 
     auto values = self.values();
     Tensor dense = at::zeros(self.sizes(), self.options().layout(kStrided));
-    if (self.dim() == 2) {
-      // Pad shape so we can treat 2-d like batched, we will squeeze out the
-      // phantom batch dim at the end
+
+    if (batch_ndim == 0) {
+      // Pad shape so we can treat non-batched like batched, we will
+      // squeeze out the phantom batch dim at the end
       compressed_indices.unsqueeze_(0);
       plain_indices.unsqueeze_(0);
-      values = values.unsqueeze_(0);
-      dense = dense.unsqueeze_(0);
+      values.unsqueeze_(0);
+      dense.unsqueeze_(0);
     }
-    if (self.dim() > 3) {
+    if (batch_ndim > 1) {
       // Flatten batch dims
       compressed_indices = compressed_indices.flatten(0, batch_ndim - 1);
       plain_indices = plain_indices.flatten(0, batch_ndim - 1);
@@ -620,38 +594,68 @@ Tensor sparse_compressed_to_dense(
       dense = dense.flatten(0, batch_ndim - 1);
     }
 
-    // At this point everything has 3d shape either the batch dim was inserted,
-    // existed already or was flattened from multiple batch dims
-    std::array<int64_t, 2> blocksize = {values.size(-2), values.size(-1)};
+    // At this point everything the batch dim was inserted, existed
+    // already or was flattened from multiple batch dims
     auto n_batch = values.size(0);
-    // If we already had batch dim(s) and any of them were zero we can take the
-    // early exit.
+    // If we already had batch dim(s) and any of them were zero we can
+    // take the early exit
     if (n_batch == 0) {
       return dense.reshape(self.sizes());
     }
-    // Due to early exit above this reshape should always be valid
-    dense = dense.reshape({n_batch, -1, values.size(-2), values.size(-1)});
-    for (auto batch : c10::irange(n_batch)) {
-      Tensor batch_indices = at::_convert_indices_from_csr_to_coo(
-          compressed_indices[batch],
-          plain_indices[batch],
-          false,
-          self.layout() == kSparseBsc);
-      auto batch_row_indices = batch_indices.select(0, 0);
-      auto batch_col_indices = batch_indices.select(0, 1);
-      auto offsets = batch_col_indices +
-          batch_row_indices * (self.size(-1) / blocksize[1]);
-      dense[batch].index_add_(0, offsets, values[batch]);
+
+    int64_t nrows, ncols;
+    auto dense_reshaped_size = dense.sizes().vec();
+    if (!block_sparse) {
+      nrows = self.size(batch_ndim);
+      ncols = self.size(batch_ndim + 1);
+      dense_reshaped_size.erase(dense_reshaped_size.begin());
+      dense_reshaped_size.erase(dense_reshaped_size.begin());
+    } else {
+      std::array<int64_t, 2> blocksize = {self.size(batch_ndim + 2), self.size(batch_ndim + 3)};
+      nrows = self.size(batch_ndim) / blocksize[0];
+      ncols = self.size(batch_ndim + 1) / blocksize[1];
+      dense_reshaped_size[1] = blocksize[0];
+      dense_reshaped_size[2] = blocksize[1];
     }
+    dense_reshaped_size[0] = n_batch * nrows * ncols;
+    dense = dense.reshape(dense_reshaped_size);
+
+    int64_t nnz_per_batch = values.size(1);
+    auto options = compressed_indices.options();
+    auto batch_indices = at::arange(0, n_batch, options).repeat_interleave(nnz_per_batch);
+    auto ncompressed = compressed_rows ? nrows : ncols;
+    auto compressed_indices_over_all_batches =
+      at::cat({compressed_indices.slice(1, 0, ncompressed).flatten()
+              + nnz_per_batch * at::arange(0, n_batch, options).repeat_interleave(ncompressed),
+              n_batch * nnz_per_batch * at::ones({1}, options)});
+    Tensor indices = at::_convert_indices_from_csr_to_coo(
+        compressed_indices_over_all_batches,
+        plain_indices.flatten(),
+        false,
+        !compressed_rows);
+    auto row_indices = indices.select(0, 0);
+    auto col_indices = indices.select(0, 1);
+    if (compressed_rows) {
+      row_indices -= batch_indices * nrows;
+    } else {
+      col_indices -= batch_indices * ncols;
+    }
+    auto offsets = col_indices + row_indices * ncols + batch_indices * nrows * ncols;
+    dense.index_add_(0, offsets, values.flatten(0, 1));
 
     // un-tile the result, NOTE: The final reshape uses the original
-    // self.sizes() which will squeeze out the extra batch dim if we put one in
-    return dense
-        .unflatten(
-            1, {self.size(-2) / blocksize[0], self.size(-1) / blocksize[1]})
+    // self.sizes() which will squeeze out the extra batch dim if we
+    // put one in
+    if (!block_sparse) {
+      return dense.reshape(self.sizes());
+    } else {
+      return dense
+        .unflatten(0, {-1, nrows, ncols})
         .transpose(2, 3)
         .reshape(self.sizes());
+    }
   }
+
   return self.to_sparse().to_dense();
 }
 
