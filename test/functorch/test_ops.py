@@ -396,7 +396,8 @@ class TestOperators(TestCase):
 
             self.assertEqual(result, expected)
 
-    @ops(op_db + additional_op_db, allowed_dtypes=(torch.float,))
+    @_set_autograd_function_extension_enabled()
+    @ops(op_db + additional_op_db + autograd_function_db, allowed_dtypes=(torch.float,))
     @skipOps('TestOperators', 'test_jvp', set({
         # Composite ops that do bad things. Need to be fixed in PyTorch core.
         # RuntimeError: Cannot access data pointer of Tensor that doesn't have storage
@@ -412,6 +413,7 @@ class TestOperators(TestCase):
         xfail('nn.functional._scaled_dot_product_attention', device_type='cuda'),
 
         xfail('nn.functional.rrelu'),  # in-place test errors out with no formula implemented
+        xfail('NumpyExpMarkDirtyAutogradFunction'),  # https://github.com/pytorch/pytorch/issues/90225
 
         # --- Non-Contiguous Failures! ---
         # This is expected to fail as the operator
@@ -947,11 +949,13 @@ class TestOperators(TestCase):
         xfail('nn.functional.batch_norm', 'without_cudnn'),
         xfail("native_batch_norm"),
         xfail("_native_batch_norm_legit"),
+        xfail('NumpyExpMarkDirtyAutogradFunction'),  # https://github.com/pytorch/pytorch/issues/90225
         # ----------------------------------------------------------------------
     }
 
+    @_set_autograd_function_extension_enabled()
     @with_tf32_off  # https://github.com/pytorch/pytorch/issues/86798
-    @ops(op_db + additional_op_db, allowed_dtypes=(torch.float,))
+    @ops(op_db + additional_op_db + autograd_function_db, allowed_dtypes=(torch.float,))
     @toleranceOverride({torch.float32: tol(atol=1e-04, rtol=1e-04)})
     @opsToleranceOverride('TestOperators', 'test_vmapjvpall', (
         tol1('nn.functional.conv_transpose3d',
@@ -986,7 +990,8 @@ class TestOperators(TestCase):
             for loop_out, batched_out in generator:
                 self.assertEqual(loop_out, batched_out)
 
-    @ops(op_db + additional_op_db, allowed_dtypes=(torch.float,))
+    @_set_autograd_function_extension_enabled()
+    @ops(op_db + additional_op_db + autograd_function_db, allowed_dtypes=(torch.float,))
     @skipOps('TestOperators', 'test_vmapjvpall_has_batch_rule', vmapjvpall_fail.union({
         skip('to'),  # RuntimeError: required rank 4 tensor to use channels_last format
         xfail('cdouble'),  # RuntimeError: required rank 4 tensor to use channels_last format
@@ -1293,7 +1298,8 @@ class TestOperators(TestCase):
         else:
             self.assertEqual(jacobian_jvp, jacobian_vjp)
 
-    @ops(op_db + additional_op_db, allowed_dtypes=(torch.float,))
+    @_set_autograd_function_extension_enabled()
+    @ops(op_db + additional_op_db + autograd_function_db, allowed_dtypes=(torch.float,))
     @skipOps('TestOperators', 'test_jvpvjp', vjp_fail.union({
         xfail('to_sparse', ''),  # NYI
         # RuntimeError: Trying to set a forward gradient that has a different size than that of the original Tensor,
@@ -1308,6 +1314,8 @@ class TestOperators(TestCase):
         xfail('nn.functional.hardsigmoid', ''),  # NYI: forward AD for hardsigmoid_backward
         xfail('nn.functional.huber_loss', ''),  # NYI: forward AD for huber_loss_backward
         xfail('nn.functional.logsigmoid', ''),  # not differentiable w.r.t. buffer
+        xfail('NumpyCubeNotComposableAutogradFunction'),  # not composable
+        xfail('NumpySortAutogradFunction'),  # https://github.com/pytorch/pytorch/issues/90067
         xfail('renorm', ''),  # NYI: forward AD for renorm
         xfail('ormqr', ''),  # NYI: forward AD for ormqr
         xfail('symeig', ''),  # NYI: forward AD for symeig
@@ -1392,6 +1400,7 @@ class TestOperators(TestCase):
             expected = reference(primals, cotangents, primals_tangents, cotangents_tangents)
             self.assertEqual(result, expected)
 
+    @_set_autograd_function_extension_enabled()
     @with_tf32_off  # https://github.com/pytorch/pytorch/issues/86798
     @skipOps('TestOperators', 'test_vmapjvpvjp', vjp_fail.union({
         # Following operatos take too long, hence skipped
@@ -1405,6 +1414,9 @@ class TestOperators(TestCase):
         skip('nn.functional.bilinear'),
         skip('native_layer_norm'),
         skip('ormqr'),
+
+        # Not actually a problem
+        xfail('NumpyCubeNotComposableAutogradFunction'),  # not composable
 
         # Potential bugs/errors
         xfail('as_strided'),  # AssertionError: Tensor-likes are not close!
@@ -1428,6 +1440,7 @@ class TestOperators(TestCase):
         xfail('mvlgamma', 'mvlgamma_p_3'),  # vmap: inplace into a regular tensor
         xfail('mvlgamma', 'mvlgamma_p_5'),  # vmap: inplace into a regular tensor
         xfail('nanquantile'),  # Batching rule not implemented for aten::equal
+        xfail('NumpySortAutogradFunction'),  # https://github.com/pytorch/pytorch/issues/90067
         # RuntimeError: Batch norm got a batched tensor as input while the
         # running_mean or running_var, which will be updated in place,
         # were not batched.
@@ -1487,7 +1500,7 @@ class TestOperators(TestCase):
         xfail("_native_batch_norm_legit"),
         xfail('native_dropout_backward',)
     }))
-    @ops(op_db + additional_op_db, allowed_dtypes=(torch.float,))
+    @ops(op_db + additional_op_db + autograd_function_db, allowed_dtypes=(torch.float,))
     @toleranceOverride({torch.float32: tol(atol=1e-04, rtol=1e-04)})
     @opsToleranceOverride('TestOperators', 'test_vmapjvpvjp', (
         tol1('linalg.svd',
