@@ -336,7 +336,8 @@ class CppVecOverrides(OpOverrides):
 
     @staticmethod
     def where(a, b, c):
-        return f"decltype({b})::blendv({c}, {b}, {a})"
+        # return a ? b : c
+        return f"decltype({b})::blendv({c}, {b}, {a} > decltype({a})(0))"
 
     @staticmethod
     def sign(x):
@@ -359,7 +360,10 @@ class CppVecOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype(x, dtype):
-        assert dtype in [torch.bool], f"{__name__} does not support {dtype}"
+        assert dtype in [
+            torch.bool,
+            torch.float32,
+        ], f"{__name__} does not support {dtype}"
         return f"({x})"
 
 
@@ -784,19 +788,33 @@ class CppVecKernel(CppKernel):
         expanded_index = sympy.expand(index)
         new_index = self.transform_index(index)
 
-        if expanded_index == new_index:
-            line = f"at::vec::Vectorized<float>({var}[{cexpr(index)}])"
-        else:
-            if V.graph.get_dtype(name) in [torch.bool, torch.uint8]:
+        def load_help(load_index, nelements):
+            if V.graph.get_dtype(name) != torch.float:
                 g_tmp_buf = f"g_tmp_buffer_{var}"
-                nelements = codecache.pick_vec_isa().nelements()
-                self.loads.writeline(f"float {g_tmp_buf}[{nelements}] = {{0}};")
+                if f"float {g_tmp_buf}[{nelements}] = {{0}};" not in self.loads._lines:
+                    self.loads.writeline(f"float {g_tmp_buf}[{nelements}] = {{0}};")
                 self.loads.writeline(
-                    f"flag_to_float({var} + {cexpr(new_index)}, {g_tmp_buf}, {nelements});"
+                    f"to_float({var} + {cexpr(load_index)}, {g_tmp_buf}, {nelements});"
                 )
-                line = f"at::vec::Vectorized<float>::loadu({g_tmp_buf})"
+                if nelements == 1:
+                    line = (
+                        f"at::vec::Vectorized<float>({g_tmp_buf}[{cexpr(load_index)}])"
+                    )
+                else:
+                    line = f"at::vec::Vectorized<float>::loadu({g_tmp_buf})"
             else:
-                line = f"at::vec::Vectorized<float>::loadu({var} + {cexpr(new_index)})"
+                if nelements == 1:
+                    line = f"at::vec::Vectorized<float>({var}[{cexpr(load_index)}])"
+                else:
+                    line = f"at::vec::Vectorized<float>::loadu({var} + {cexpr(load_index)})"
+            return line
+
+        if expanded_index == new_index:
+            nelements = 1
+            line = load_help(index, nelements)
+        else:
+            nelements = codecache.pick_vec_isa().nelements()
+            line = load_help(new_index, nelements)
 
         return self.cse.generate(self.loads, line)
 
@@ -907,6 +925,7 @@ class CppVecKernelChecker(CppVecKernel):
             torch.float32,
             torch.bool,
             torch.uint8,
+            torch.float64,
         ]:
             self.simd_vec = False
             return self.simd_vec
@@ -1007,7 +1026,7 @@ class CppVecKernelChecker(CppVecKernel):
 
             @staticmethod
             def to_dtype(x, dtype):
-                if dtype != torch.bool:
+                if dtype not in [torch.bool, torch.float32]:
                     self.simd_vec = False
                 return x
 
