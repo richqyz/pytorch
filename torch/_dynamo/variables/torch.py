@@ -310,6 +310,15 @@ class TorchVariable(VariableTracker):
         elif self.value is torch.jit.annotate:
             assert len(args) == 2
             return args[1]
+        elif self.value is torch.backends.cudnn.is_acceptable:
+            # is_acceptable(tensor) returns true if
+            #   (a) tensor dtype/device are supported by cudnn
+            #   (b) cudnn is available
+            #   (c) some initialization has completed
+            # technically, it depends on some global state from (c) (torch.backends.cudnn.__cudnn_version)
+            return ConstantVariable(
+                torch.backends.cudnn.is_acceptable(*args, **kwargs), **options
+            )
         if (
             self.value.__name__ == "get_state"
             and hasattr(self.value, "__self__")
