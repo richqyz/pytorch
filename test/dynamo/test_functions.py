@@ -15,6 +15,7 @@ import torch._dynamo.test_case
 import torch._dynamo.testing
 from torch import sub
 from torch._dynamo.testing import requires_static_shapes
+from torch._dynamo.utils import same
 from torch.nn import functional as F
 
 tensor_for_import_testing = torch.ones(10, 10)
@@ -712,6 +713,46 @@ class FunctionTests(torch._dynamo.test_case.TestCase):
     #             return x * param
     #         case {"b": param}:
     #             return x / param
+
+
+def global_func_with_default_tensor_args(x=torch.zeros((2, 2))):
+    x.add_(1)
+    return x
+
+
+class DefaultsTests(torch._dynamo.test_case.TestCase):
+    def test_default_tensor_args(self):
+        """
+        Tests that we indeed reference (and mutate) "the one" default tensor arg
+        stored on the globally allocated function object, both from the orig and
+        compiled function
+        """
+
+        def func():
+            return global_func_with_default_tensor_args()
+
+        cnts = torch._dynamo.testing.CompileCounter()
+        compiled_func = torch.compile(func, backend=cnts)
+        for i in range(4):
+            if i % 2 == 0:
+                out = func()
+            else:
+                out = compiled_func()
+            # the inner func mutates += 1 each call
+            self.assertTrue(same(out, torch.ones_like(out) + i))
+        # Calling compiled_func twice does not recompile
+        self.assertEqual(cnts.frame_count, 1)
+        self.assertEqual(cnts.op_count, 1)
+
+        # But with a change to the guarded default tensor, we do recompile
+        with patch.object(
+            global_func_with_default_tensor_args,
+            "__defaults__",
+            (torch.ones((3, 4, 5)),),
+        ):
+            out = compiled_func()
+        self.assertEqual(cnts.frame_count, 2)
+        self.assertEqual(cnts.op_count, 2)
 
 
 if __name__ == "__main__":
