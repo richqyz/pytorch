@@ -312,6 +312,10 @@ class WrapperCodeGen(CodeGen):
             self.write_get_cuda_stream
         )
 
+    @functools.lru_cache(None)
+    def get_output_refs(self):
+        return [x.codegen_reference() for x in V.graph.graph_outputs]
+
     def write_prefix(self):
         self.prefix.splice(
             """
@@ -468,7 +472,7 @@ class WrapperCodeGen(CodeGen):
                 else:
                     self.wrapper_call.writeline(line)
 
-            output_refs = [x.codegen_reference() for x in V.graph.graph_outputs]
+            output_refs = self.get_output_refs()
             self.generate_return(output_refs)
 
         with result.indent():
@@ -558,6 +562,20 @@ class CppWrapperCodeGen(WrapperCodeGen):
         self._call_func_id = next(CppWrapperCodeGen.call_func_id)
         super().__init__()
 
+    @functools.lru_cache(None)
+    def get_output_refs(self):
+        def has_cpp_codegen_func(x):
+            return hasattr(x, "cpp_wrapper_codegen_reference") and callable(
+                x.cpp_wrapper_codegen_reference
+            )
+
+        return [
+            x.cpp_wrapper_codegen_reference()
+            if has_cpp_codegen_func(x)
+            else x.codegen_reference()
+            for x in V.graph.graph_outputs
+        ]
+
     def write_prefix(self):
         self.prefix.splice(
             """
@@ -572,7 +590,7 @@ class CppWrapperCodeGen(WrapperCodeGen):
         )
         with self.wrapper_call.indent():
             inputs_len = len(V.graph.graph_inputs.keys())
-            output_refs = [x.codegen_reference() for x in V.graph.graph_outputs]
+            output_refs = self.get_output_refs()
             if output_refs:
                 if len(output_refs) == 1:
                     output_types = "at::Tensor"
